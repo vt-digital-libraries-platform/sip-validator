@@ -1,43 +1,70 @@
 import os
 import csv
 import re
-from datetime import datetime
 from collections import OrderedDict
 
-def validate_date_format(date_text):
-    try:
-        datetime.strptime(date_text, '%Y/%m/%d')
-        return True
-    except ValueError:
-        return False
+def validate_special_characters(string, allow_spaces=False):
+    """
+    Validate special characters.
+    If allow_spaces is True, allow spaces for folder names.
+    """
+    if allow_spaces:
+        # Accept alphanumeric characters, _ (underscore), - (hyphen), and spaces
+        return bool(re.match(r'^[a-z0-9 _-]+$', string.lower()))
+    else:
+        # Accept only alphanumeric characters, _ (underscore), and - (hyphen)
+        return bool(re.match(r'^[a-z0-9_-]+$', string.lower()))
 
-def validate_special_characters(string):
-    return bool(re.match(r'^[a-zA-Z0-9@#$%&*/!\']+$', string.lower()))
+def validate_visibility(value):
+    """
+    Validate the visibility field. Accepted values are 'true' or 'false', case insensitive.
+    """
+    return value.lower() in ['true', 'false']
 
 def check_directory_structure(root_path):
-    required_folders = ['Data', 'Manifest', 'Metadata']
+    # Add "Supporting Information" and "readme" to the required folders
+    required_folders = ['Data', 'Manifest', 'Metadata', 'Supporting Information', 'readme']
     errors = OrderedDict()
+    
     try:
         existing_folders = os.listdir(root_path)
     except Exception as e:
         errors[f"Error accessing directory {root_path}: {str(e)}"] = None
         return errors
     
-    extra_folders = [folder for folder in existing_folders if folder not in required_folders and os.path.isdir(os.path.join(root_path, folder))]
+    # Check for special characters in folder names (allow spaces for folder names)
+    for folder in existing_folders:
+        folder_path = os.path.join(root_path, folder)
+        if os.path.isdir(folder_path):  # Only check folders for special characters
+            if not validate_special_characters(folder, allow_spaces=True):
+                errors[f"Folder name contains invalid special characters: {folder}"] = None
+    
+    # Check for required folders without checking capitalization
+    extra_folders = [folder for folder in existing_folders if os.path.isdir(os.path.join(root_path, folder)) and folder.lower() not in [f.lower() for f in required_folders]]
     for folder in required_folders:
-        matched_folders = [f for f in existing_folders if re.match(rf'{folder}[^a-zA-Z0-9]*$', f, re.IGNORECASE)]
-        if not matched_folders:
+        if not any(f.lower() == folder.lower() for f in existing_folders if os.path.isdir(os.path.join(root_path, f))):
             errors[f"Missing required folder: {folder}"] = None
-        else:
-            for matched_folder in matched_folders:
-                if matched_folder != folder:
-                    errors[f"Folder name should be {folder} but found {matched_folder}"] = None
-                elif not validate_special_characters(matched_folder):
-                    errors[f"Folder name contains special characters: {matched_folder}"] = None
+
+    # Check for README.md or README.txt in the root directory or 'readme' folder
+    readme_exists = False
+    for fname in os.listdir(root_path):
+        if fname.lower() in ['readme.md', 'readme.txt']:
+            readme_exists = True
+            break
+    
+    # Also check in a 'readme' folder, if it exists
+    readme_folder = os.path.join(root_path, 'readme')
+    if os.path.exists(readme_folder) and os.path.isdir(readme_folder):
+        for fname in os.listdir(readme_folder):
+            if fname.lower() in ['readme.md', 'readme.txt']:
+                readme_exists = True
+                break
+
+    if not readme_exists:
+        errors["Missing README file with .txt or .md extension"] = None
+    
     if extra_folders:
         errors[f"Extra folders found: {', '.join(extra_folders)}"] = None
-    if not any(fname.startswith('README') and fname.split('.')[-1] in ['txt', 'md'] for fname in existing_folders):
-        errors["Missing README file with .txt or .md extension"] = None
     if not errors:
         errors["Directory structure is valid."] = None
     return errors
@@ -109,13 +136,13 @@ def read_csv_file(file_path):
 def validate_metadata_files(root_path):
     metadata_path = os.path.join(root_path, 'Metadata')
     receipt = OrderedDict()
-    required_fields = ['identifier', 'title', 'description', 'visibility', 'rights_holder']
+    required_fields = ['identifier', 'title', 'visibility']
     
     if not os.path.exists(metadata_path):
         receipt["Missing required folder: Metadata"] = None
         return receipt
     
-    # Scan for all metadata files that match the patterns
+    # Ensure either 'rights' or 'license' is present only for item_metadata.csv
     for file_name in os.listdir(metadata_path):
         if re.search(r'(collection_metadata\.csv|item_metadata\.csv)$', file_name.lower()):
             file_path = os.path.join(metadata_path, file_name)
@@ -141,33 +168,31 @@ def validate_metadata_files(root_path):
                         if matched_field != field:
                             receipt[f"Validation error in {file_name}: Field name should be {field} but found {matched_field}"] = None
                             missing_field = True
-                        elif field != 'rights_holder' and not validate_special_characters(matched_field):
-                            receipt[f"Validation error in {file_name}: Field name contains special characters: {matched_field}"] = None
-                            missing_field = True
+                        elif field == 'visibility' and not validate_visibility(rows[0]['visibility']):
+                            receipt[f"Validation error in {file_name}: Invalid value for visibility: {rows[0]['visibility']} (expected 'true' or 'false')"] = None
 
-            # If any required field is missing or incorrect, skip row validation
-            if missing_field:
-                continue
+            # Skip rights/license validation for collection_metadata.csv
+            if 'collection_metadata.csv' in file_name.lower():
+                continue  # Skip rights/license check for collection_metadata
 
-            # Check each row for content
-            for row in rows:
-                identifier = row.get('identifier', 'unknown').strip()
-                
-                # Validate identifier
-                if not validate_special_characters(identifier):
-                    receipt[f"Validation error in {file_name} (identifier {identifier}): Invalid identifier."] = None
-                
-                # Validate date format
-                date = row.get('date', '').strip()
-                if date and not validate_date_format(date):
-                    receipt[f"Validation error in {file_name} (identifier {identifier}): Invalid date format."] = None
-                
-                # Required fields check
-                for field in required_fields:
-                    if field not in row or not row[field].strip():
-                        receipt[f"Validation error in {file_name} (identifier {identifier}): Missing or invalid {field}."] = None
+            # Validate rights and license fields for item_metadata.csv
+            if 'item_metadata.csv' in file_name.lower():
+                for row in rows:
+                    identifier = row.get('identifier', 'unknown').strip()
+                    
+                    # Validate identifier
+                    if not validate_special_characters(identifier):
+                        receipt[f"Validation error in {file_name} (identifier {identifier}): Invalid identifier."] = None
+                    
+                    # Validate rights or license
+                    if 'rights' in row and not re.match(r'https?://rightsstatements.org/vocab/(InC|InC-OW-EU|InC-EDU|InC-NC|InC-RUU|NoC-CR|NoC-NC|NoC-OKLR|NoC-US|CNE|UND|NKC)/1.0/', row['rights'], re.IGNORECASE):
+                        receipt[f"Validation error in {file_name} (identifier {identifier}): Invalid value for rights: {row['rights']}"] = None
+                    elif 'license' in row and not re.match(r'https?://creativecommons.org/licenses/(by/2.0|by/4.0|by-sa/4.0|by-nd/4.0|by-nc/4.0|by-nc-sa/4.0|by-nc-nd/4.0)/', row['license'], re.IGNORECASE):
+                        receipt[f"Validation error in {file_name} (identifier {identifier}): Invalid value for license: {row['license']}"] = None
+                    elif 'rights' not in row and 'license' not in row:
+                        receipt[f"Validation error in {file_name} (identifier {identifier}): Missing required field: either 'rights' or 'license'"] = None
 
-    return receipt
+    return receipt  # Always return the receipt, even if empty
 
 def write_validation_receipt(receipt, root_path):
     receipt_path = os.path.join(root_path, 'validation_receipt.txt')
